@@ -112,7 +112,8 @@ def read():
         raise ValueError(f"неправдоподобное чтение: soc={r[34]} batt_v={r[33] / 100} grid_v={r[0] / 10}")
     return {
         "grid_v": r[0] / 10,                  # 150 напряжение сети
-        "load_w": s16(r[28]),                 # 178 нагрузка
+        "load_w": s16(r[28]),                 # 178 нагрузка (иногда отдаёт 0)
+        "grid_w": s16(r[19]),                 # 169 мощность из сети через инвертор (+ — берём из сети)
         "batt_v": r[33] / 100,                # 183
         "soc":    r[34],                      # 184
         "pv_w":   r[36] + r[37],              # 186, 187
@@ -430,13 +431,19 @@ def timeline():
 def kw(w): return f"{num(w / 1000)} кВт"
 
 def grid_draw(d):
-    """(заряд, бойлер, солнце, всего Вт, всего А) — сколько берётся из сети через вводной автомат."""
+    """(заряд, бойлер, квартира, всего Вт, всего А) — сколько берётся из сети через вводной автомат.
+    Через инвертор — по мощности сети (рег. 169): она точнее нагрузки и включает сам инвертор."""
     b = live.get("boiler") if BOILER_ID else None
     bw = b[1] if b and b[0] and b[1] and b[1] >= 30 else 0
     chg = -d["batt_w"] if d["batt_w"] < -30 else 0
-    pv = d.get("pv_w") or 0
-    total = max(0, chg + bw + d["load_w"] - pv)
-    return chg, bw, pv, total, total / max(d["grid_v"], 1)
+    if d.get("grid_w", 0) > 0:
+        inv_w = d["grid_w"]
+        apt = max(0, inv_w - chg)
+    else:                                                       # старые данные / сеть не через инвертор
+        apt = max(0, d["load_w"] - (d.get("pv_w") or 0))
+        inv_w = apt + chg
+    total = inv_w + bw
+    return chg, bw, apt, total, total / max(d["grid_v"], 1)
 
 def power_lines(d):
     """Бойлер (мимо инвертора, мощность с розетки) и сумма из сети: заряд + бойлер + квартира, кВт и А."""
@@ -448,11 +455,12 @@ def power_lines(d):
         elif b[1] is None: out.append("🔥 Бойлер включён")
         elif b[1] < 30: out.append("🔥 Бойлер включён · не греет")
         else: out.append(f"🔥 Бойлер <b>{pw(b[1])}</b>")
-    chg, bw, pv, total, amps = grid_draw(d)
-    bpart = (f"бойлер {kw(bw)}" if live.get("boiler") else "бойлер ?") if BOILER_ID else None
-    parts = ([f"заряд {kw(chg)}"] if chg else []) + ([bpart] if bpart else []) + [f"квартира {kw(d['load_w'])}"]
-    out.append("🧮 " + " + ".join(parts) + (f" − солнце {kw(pv)}" if pv > 30 else "") +
-               f" = <b>{kw(total)} · {amps:.0f} А</b>" + (f" из {MAIN_A:.0f}" if MAIN_A else ""))
+    chg, bw, apt, total, amps = grid_draw(d)
+    b = live.get("boiler")
+    bpart = None if not BOILER_ID else "бойлер ?" if not b else f"бойлер {kw(bw)}" if bw else None
+    parts = ([f"заряд {kw(chg)}"] if chg else []) + ([bpart] if bpart else []) + [f"квартира {kw(apt)}"]
+    out.append("🧮 " + " + ".join(parts) + f" = <b>{kw(total)} · {amps:.1f} А</b>".replace(".", ",") +
+               (f" из {MAIN_A:.0f}" if MAIN_A else ""))
     return out
 
 def pi_line():
