@@ -1,0 +1,6 @@
+pysolarmanv5==3.0.6
+matplotlib
+tinytuya
+tuya-device-sharing-sdk
+qrcode
+pypng

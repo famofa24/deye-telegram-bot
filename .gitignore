@@ -1,0 +1,14 @@
+# секреты и локальные данные — никогда не коммитим
+.env
+data/
+.venv/
+__pycache__/
+*.pyc
+*.patch
+*.orig
+*.rej
+# tinytuya: локальные ключи розеток
+devices.json
+tinytuya.json
+tuya-raw.json
+snapshot.json

@@ -1,0 +1,13 @@
+[Unit]
+Description=Deye -> Telegram bot
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=%h/deye-tg
+EnvironmentFile=%h/deye-tg/.env
+ExecStart=%h/deye-tg/.venv/bin/python -u deye_tg.py
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=default.target
