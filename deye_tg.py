@@ -541,6 +541,7 @@ def db():
     c.execute("create table if not exists samples (ts integer primary key, soc integer, grid integer, "
               "load_w integer, batt_w integer, chg real, dis real, imp real, eload real)")
     c.execute("create table if not exists boiler (ts integer primary key, is_on integer, w real)")
+    c.execute("create table if not exists climate (ts integer, name text, t real, h integer, primary key (ts, name))")
     return c
 
 def boiler_add(b):
@@ -1046,10 +1047,35 @@ def climate_loop():
                 m.refresh_mq()
                 m.mq.add_message_listener(_on_mq)
             log.info("tuya: подписка на датчики включена")
-            return                                      # SharingMQ сам переподключается
+            break                                       # SharingMQ сам переподключается
         except Exception as e:
             log.warning("tuya mq start: %s %s", type(e).__name__, e)
             time.sleep(300)
+    while True:                                         # история для стрелок и графиков — раз в 10 мин
+        try:
+            climate_record(climate_read())
+        except Exception as e:
+            log.warning("climate history: %s", e)
+        time.sleep(600)
+
+def climate_record(data):
+    if not data: return
+    now_ = int(time.time())
+    rows = [(now_, name, t, h) for name, t, h, _, _, at in data
+            if not (at and now_ - at > 1800)]           # застывшие показания не пишем
+    with closing(db()) as c, c:
+        c.executemany("insert or replace into climate values (?,?,?,?)", rows)
+
+def climate_ago(name, sec=3600):
+    """(°C, %) у датчика примерно sec секунд назад (±15 мин) или None."""
+    with closing(db()) as c:
+        return c.execute("select t, h from climate where name = ? and ts between ? and ? order by abs(ts - ?) limit 1",
+                         (name, time.time() - sec - 900, time.time() - sec + 900, time.time() - sec)).fetchone()
+
+def trend(cur, old, step, unit, d=1):
+    """« ↗ +0,4°» / « ↘ −3%» / «» — изменение, если оно не меньше step."""
+    if old is None or cur is None or abs(cur - old) < step: return ""
+    return f" {'↗' if cur > old else '↘'} {'+' if cur > old else '−'}{num(abs(cur - old), d)}{unit}"
 
 def climate_read():
     """[(имя, °C, %влажности | None, батарейка | None, онлайн, когда обновлялось | None)]. None — облака нет."""
@@ -1084,11 +1110,15 @@ def climate_text():
         return head + ("\n<i>Нет связи с облаком Tuya — попробуй позже</i>" if os.path.exists(TUYA_TOKEN)
                        else "\n<i>Вход в Tuya не настроен: запусти tuya_login.py</i>")
     if not data: return head + "\n<i>Датчиков температуры не нашлось</i>"
-    card, notes_ = [], []
+    card, notes_, arrows = [], [], False
     for name, t, h, bat, online, at in data:
-        line = f"{'🌡' if online else '📴'} {html.escape(name)}: <b>{num(t)} °C</b>"
+        old = climate_ago(name)
+        tt_ = trend(t, old and old[0], 0.2, "°")
+        line = f"{'🌡' if online else '📴'} {html.escape(name)}: <b>{num(t)} °C</b>{tt_}"
         if h is not None:
-            line += f" · 💧 {h}%" + (" <i>влажно</i>" if h >= HUM_HIGH else " <i>сухо</i>" if h <= HUM_LOW else "")
+            th = trend(h, old and old[1], 2, "%", 0)
+            arrows = arrows or bool(tt_ or th)
+            line += f" · 💧 {h}%{th}" + (" <i>влажно</i>" if h >= HUM_HIGH else " <i>сухо</i>" if h <= HUM_LOW else "")
         if at and time.time() - at > 1800: line += f" · <i>{dur((time.time() - at) / 3600)} назад</i>"
         if isinstance(bat, int) and bat <= 20 or bat == "low":
             line += " · 🪫"; notes_.append(f"🪫 {html.escape(name)}: пора сменить батарейку")
@@ -1096,6 +1126,7 @@ def climate_text():
         card.append(line)
     wet = [n for n, _, h, *_ in data if h is not None and h >= HUM_HIGH]
     if wet: notes_.insert(0, f"💧 Влажность выше {HUM_HIGH}% — стоит проветрить")
+    if arrows: notes_.append("↗↘ — изменение за последний час")
     return "\n".join([head, quote(card)] + [f"<i>{x}</i>" for x in notes_])
 
 # ================= финансы: квартира + бойлер =================
@@ -1177,6 +1208,66 @@ def kb_finance(p):
          {"text": mark("m", "📆 Месяц"), "callback_data": "fm"}],
         [{"text": "🔄 Сегодня", "callback_data": "fd"}]]})
 
+def make_climate_graph(hours):
+    """PNG: температура и влажность по датчикам (два графика друг под другом). (png | None, подпись)."""
+    with closing(db()) as c:
+        rows = c.execute("select ts, name, t, h from climate where ts >= ? order by ts", (time.time() - hours * 3600,)).fetchall()
+    title = "сутки" if hours <= 24 else f"{hours // 24} дней"
+    names = sorted({r[1] for r in rows})
+    if not rows or max(sum(1 for r in rows if r[1] == n) for n in names) < 3:
+        return None, "🌡 <i>Графики появятся, когда накопится история: показания пишутся раз в 10 минут</i>"
+    try:
+        import matplotlib; matplotlib.use("Agg")
+        import matplotlib.pyplot as plt, matplotlib.dates as mdates
+    except ImportError:
+        return None, "⚠️ Для графиков нужна библиотека matplotlib"
+    BG, FG, SUB, MUT, GRID = "#17212b", "#eef1f4", "#9aa7b4", "#5f6d7a", "#26323e"
+    COLORS = ["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#0ca30c", "#9085e9"]   # фиксированный порядок
+    plt.rcParams.update({"font.size": 10, "text.color": FG, "axes.labelcolor": SUB, "xtick.color": SUB, "ytick.color": MUT})
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(8, 6), dpi=160, sharex=True)
+    fig.patch.set_facecolor(BG)
+    dtt = lambda t: datetime.fromtimestamp(t, TZ)
+    cap_lines, ends = [], {a1: [], a2: []}
+    for i, n in enumerate(names):
+        pts = [r for r in rows if r[1] == n]
+        col = COLORS[i % len(COLORS)]
+        xs = [dtt(r[0]) for r in pts]
+        ts_, hs = [r[2] for r in pts], [r[3] for r in pts]
+        for ax, ys, unit in ((a1, ts_, "°"), (a2, hs, "%")):
+            seg_x, seg_y = [], []                                         # разрыв линии на дырах > 40 мин
+            for j, (x, y) in enumerate(zip(xs, ys)):
+                if j and (pts[j][0] - pts[j - 1][0]) > 2400: seg_x.append(None); seg_y.append(None)
+                seg_x.append(x); seg_y.append(y)
+            ax.plot([x for x in seg_x], [y if y is not None else float("nan") for y in seg_y], color=col, lw=2,
+                    label=n if ax is a1 else None)
+            if ys and ys[-1] is not None:
+                ends[ax].append([ys[-1], f"  {num(ys[-1], 1 if unit == '°' else 0)}{unit}", xs[-1]])
+        hv = [h for h in hs if h is not None]
+        cap_lines.append(f"{html.escape(n)}: {num(min(ts_))}…{num(max(ts_))} °C" + (f" · 💧 {min(hv)}…{max(hv)}%" if hv else ""))
+    for ax, lab in ((a1, "Температура, °C"), (a2, "Влажность, %")):
+        ax.set_facecolor(BG); ax.grid(color=GRID, lw=0.8); ax.set_axisbelow(True); ax.tick_params(length=0)
+        for sp in ax.spines.values(): sp.set_visible(False)
+        ax.set_ylabel(lab, fontsize=9)
+    for ax, vals in ((a1, [r[2] for r in rows]), (a2, [r[3] for r in rows if r[3] is not None])):
+        lo, hi = min(vals), max(vals); pad = max(1.0, (hi - lo) * 0.12)
+        ax.set_ylim(lo - pad, hi + pad)
+        gap = (hi - lo + 2 * pad) * 0.055                                  # подписи в конце линий не налезают
+        prev = None
+        for e in sorted(ends[ax], key=lambda e: e[0]):
+            y = e[0] if prev is None else max(e[0], prev + gap)
+            ax.text(e[2], y, e[1], color=FG, fontsize=8, va="center"); prev = y
+    y0, y1 = a2.get_ylim()
+    if HUM_HIGH < y1: a2.axhspan(max(HUM_HIGH, y0), y1, color="#3987e5", alpha=0.07, lw=0)
+    a2.set_ylim(y0, y1)
+    if y0 < HUM_HIGH < y1: a2.text(0.005, HUM_HIGH + 0.5, f"влажно > {HUM_HIGH}%", transform=a2.get_yaxis_transform(), fontsize=7.5, color=SUB, va="bottom")
+    a2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M" if hours <= 48 else "%d.%m", tz=TZ))
+    fig.legend(loc="lower center", ncol=min(4, len(names)), frameon=False, fontsize=9, labelcolor=FG)
+    fig.text(0.02, 0.975, "Климат", fontsize=14, fontweight="bold", va="top")
+    fig.text(0.13, 0.97, f"· {title}", fontsize=11, color=SUB, va="top")
+    fig.subplots_adjust(left=0.09, right=0.93, top=0.92, bottom=0.11, hspace=0.12)
+    buf = io.BytesIO(); fig.savefig(buf, format="png", facecolor=BG); plt.close(fig)
+    return buf.getvalue(), f"🌡 <b>Климат</b> · {title}\n" + quote(cap_lines)
+
 # ================= telegram =================
 outbox = []  # (ts, text, kb) — копится, если нет интернета
 
@@ -1197,7 +1288,8 @@ def kb_boiler_text(p):                                                          
          {"text": mark("m", "📆 Месяц"), "callback_data": "btm"}],
         [{"text": "🔄 Сегодня", "callback_data": "btd"}]
         + ([{"text": "📈 График", "callback_data": "b" + {"d": "1", "w": "7", "m": "m"}[p]}] if p != "y" else [])]})
-KB_CLIMATE = kbs(("🔄 Обновить", "cl"))
+KB_CLIMATE = kbs(("🔄 Обновить", "cl"), ("📈 Графики", "clg24"))
+KB_CLIMATE_G = kbs(("📈 Сутки", "clg24"), ("🗓 7 дней", "clg168"))
 KB_NONE = json.dumps({"inline_keyboard": []})
 KB_GRAPH = json.dumps({"inline_keyboard": [[{"text": "📈 Сутки", "callback_data": "g24"},
                                              {"text": "📈 7 дней", "callback_data": "g168"}]]})
@@ -1485,6 +1577,12 @@ def handle_update(u):
                 edit(msg["message_id"], "♻️ <i>Перезапуск отменён</i>", KB_NONE); return
             edit(msg["message_id"], f"♻️ <b>Перезапускаю бота</b> · {tts(time.time())}\n<i>Вернусь примерно через 20 секунд</i>", KB_NONE)
             restart_now(); return
+        if data in ("clg24", "clg168"):
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Рисую график…")
+            png, cap = make_climate_graph(int(data[3:]))
+            if png: tg_photo(png, cap, KB_CLIMATE_G)
+            else: tg_send(cap, KB_NONE, silent=True)
+            return
         if data == "cl":
             tg("answerCallbackQuery", callback_query_id=cq["id"], text="Спрашиваю датчики…")
             edit(msg["message_id"], climate_text(), KB_CLIMATE); return
