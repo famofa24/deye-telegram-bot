@@ -150,8 +150,30 @@ def _boiler_dev():
                                         connection_timeout=3, connection_retry_limit=2, connection_retry_delay=1)
     return _boiler
 
+_cloud_at = 0                                         # когда последний раз обновляли устройства из облака
+
+def boiler_cloud(on=None):
+    """Запасной путь через облако Tuya, если розетка не отвечает в локальной сети (другая точка Wi-Fi и т. п.).
+    on=None — прочитать (включён, Вт); True/False — переключить. None — облака нет."""
+    global _cloud_at
+    if not os.path.exists(TUYA_TOKEN): return None
+    try:
+        with tuya_lock:
+            m = tuya_mgr()
+            if on is not None:
+                m.send_commands(BOILER_ID, [{"code": "switch_1", "value": bool(on)}])
+                _cloud_at = 0; return None
+            if BOILER_ID not in m.device_map or time.time() - _cloud_at > (300 if m.mq else 60):
+                m.update_device_cache(); _cloud_at = time.time()     # между обновлениями статус свежий по MQTT
+            st = m.device_map[BOILER_ID].status
+        p = st.get("cur_power")
+        return bool(st.get("switch_1")), (p / 10 if isinstance(p, (int, float)) else None)
+    except Exception as e:
+        log.warning("boiler cloud: %s %s", type(e).__name__, e)
+        return None
+
 def boiler_state():
-    """(включён, мощность Вт | None) или None, если розетка не отвечает."""
+    """(включён, мощность Вт | None) или None, если розетка не отвечает ни локально, ни через облако."""
     if not BOILER_ID: return None
     global _boiler
     with boiler_lock:
@@ -160,22 +182,34 @@ def boiler_state():
             dps = st.get("dps") or {}
             if "Error" in st or "1" not in dps: raise RuntimeError(st.get("Error", "нет dps"))
             p = dps.get(BOILER_POWER_DP)                              # мощность в 0,1 Вт
+            if live.get("boiler_src") == "cloud": log.info("бойлер снова отвечает в локальной сети")
+            live["boiler_src"] = "local"
             return bool(dps["1"]), (p / 10 if isinstance(p, (int, float)) else None)
         except Exception as e:
-            log.warning("boiler: %s %s", type(e).__name__, e); _boiler = None
-            return None
+            if live.get("boiler_src") != "cloud": log.warning("boiler: %s %s", type(e).__name__, e)
+            _boiler = None
+    c = boiler_cloud()
+    if c is not None:
+        if live.get("boiler_src") != "cloud": log.warning("бойлер: локально не отвечает, работаю через облако Tuya")
+        live["boiler_src"] = "cloud"
+    else:
+        live["boiler_src"] = None
+    return c
 
 def boiler_set(on):
     """Включить/выключить бойлер с проверкой. True — розетка подтвердила."""
     if not BOILER_ID: return None
     global _boiler
-    for _ in range(3):
+    for i in range(3):
         with boiler_lock:
             try:
                 dev = _boiler_dev()
-                dev.turn_on() if on else dev.turn_off()
+                r = dev.turn_on() if on else dev.turn_off()
+                if isinstance(r, dict) and "Error" in r: raise RuntimeError(r["Error"])
             except Exception as e:
                 log.warning("boiler: %s %s", type(e).__name__, e); _boiler = None
+                boiler_cloud(on)                                      # локально не вышло — через облако
+                time.sleep(2)
         s = boiler_state()
         if s and s[0] == on:
             log.info("бойлер %s", "включён" if on else "выключен"); live["boiler"] = s
@@ -922,6 +956,7 @@ def boiler_text(period):
     b = live.get("boiler")
     now_line = ("⚠️ нет связи с розеткой" if not b else "⏸ розетка выключена" if not b[0] else
                 f"🔥 греет <b>{pw(b[1])}</b>" if b[1] and b[1] >= 30 else "✅ вода нагрета, не греет")
+    if b and live.get("boiler_src") == "cloud": now_line += " · <i>через облако</i>"
     n_days = 1 if period == "y" else (today - start_day).days + 1
     split = boiler_buckets(start, n_days, 86400)
     nk, dk = sum(x[0] for x in split), sum(x[1] for x in split)
