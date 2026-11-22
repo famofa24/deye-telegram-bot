@@ -1062,7 +1062,7 @@ def climate_record(data):
     if not data: return
     now_ = int(time.time())
     rows = [(now_, name, t, h) for name, t, h, _, _, at in data
-            if not (at and now_ - at > 1800)]           # застывшие показания не пишем
+            if not (at and now_ - at > 3 * 3600)]       # датчики шлют только изменения: старше 3 ч — не пишем
     with closing(db()) as c, c:
         c.executemany("insert or replace into climate values (?,?,?,?)", rows)
 
@@ -1234,12 +1234,12 @@ def make_climate_graph(hours):
         xs = [dtt(r[0]) for r in pts]
         ts_, hs = [r[2] for r in pts], [r[3] for r in pts]
         for ax, ys, unit in ((a1, ts_, "°"), (a2, hs, "%")):
-            seg_x, seg_y = [], []                                         # разрыв линии на дырах > 40 мин
+            seg_x, seg_y = [], []                                         # разрыв линии на дырах > 3 ч
             for j, (x, y) in enumerate(zip(xs, ys)):
-                if j and (pts[j][0] - pts[j - 1][0]) > 2400: seg_x.append(None); seg_y.append(None)
-                seg_x.append(x); seg_y.append(y)
-            ax.plot([x for x in seg_x], [y if y is not None else float("nan") for y in seg_y], color=col, lw=2,
-                    label=n if ax is a1 else None)
+                if j and (pts[j][0] - pts[j - 1][0]) > 3 * 3600:
+                    seg_x.append(xs[j - 1] + timedelta(seconds=1)); seg_y.append(float("nan"))   # NaN — разрыв линии
+                seg_x.append(x); seg_y.append(float("nan") if y is None else y)
+            ax.plot(seg_x, seg_y, color=col, lw=2, label=n if ax is a1 else None)
             if ys and ys[-1] is not None:
                 ends[ax].append([ys[-1], f"  {num(ys[-1], 1 if unit == '°' else 0)}{unit}", xs[-1]])
         hv = [h for h in hs if h is not None]
