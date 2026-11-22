@@ -1290,6 +1290,9 @@ def kb_boiler_text(p):                                                          
         + ([{"text": "📈 График", "callback_data": "b" + {"d": "1", "w": "7", "m": "m"}[p]}] if p != "y" else [])]})
 KB_CLIMATE = kbs(("🔄 Обновить", "cl"), ("📈 Графики", "clg24"))
 KB_CLIMATE_G = kbs(("📈 Сутки", "clg24"), ("🗓 7 дней", "clg168"))
+KB_CLEAN = json.dumps({"inline_keyboard": [[{"text": "🧹 Запросы и ответы", "callback_data": "clq"},
+                                              {"text": "🗑 Всё", "callback_data": "cla"}],
+                                             [{"text": "Отмена", "callback_data": "cln"}]]})
 KB_NONE = json.dumps({"inline_keyboard": []})
 KB_GRAPH = json.dumps({"inline_keyboard": [[{"text": "📈 Сутки", "callback_data": "g24"},
                                              {"text": "📈 7 дней", "callback_data": "g168"}]]})
@@ -1304,7 +1307,41 @@ def plain(text): return html.unescape(re.sub(r"<[^>]+>", "", text))
 NO_PREVIEW = json.dumps({"is_disabled": True})
 PRE_LANG = re.compile(r'<pre><code class="[^"]*">')
 
-def tg_send(text, keyboard=KB_NOW, effect=None, silent=False):
+# --- учёт отправленных сообщений для /clean (Telegram даёт удалять только моложе 48 ч) ---
+MSGS_FILE = os.path.join(os.path.dirname(STATE_FILE) or ".", "msgs.json")
+msgs_lock = threading.Lock()
+
+def remember(mid, kind="query"):
+    """kind: "event" — уведомление (свет, ошибки…), "query" — ответ на запрос или ваша команда."""
+    if not mid: return
+    with msgs_lock:
+        lst = [x for x in load_json(MSGS_FILE, []) if time.time() - x[1] < 49 * 3600]
+        lst.append([int(mid), int(time.time()), kind])
+        try:
+            with open(MSGS_FILE, "w") as f: json.dump(lst, f)
+        except Exception as e: log.warning("msgs: %s", e)
+
+def clean_chat(everything):
+    """Удалить сообщения моложе 48 ч: только запросы или всё. Возвращает, сколько удалено."""
+    with msgs_lock:
+        lst = load_json(MSGS_FILE, [])
+        fresh = [x for x in lst if time.time() - x[1] < 47.5 * 3600]
+        kill = [x[0] for x in fresh if everything or x[2] != "event"]
+        keep = [x for x in fresh if x[0] not in set(kill)]
+        with open(MSGS_FILE, "w") as f: json.dump(keep, f)
+    done = 0
+    for i in range(0, len(kill), 100):
+        part = kill[i:i + 100]
+        try:
+            tg("deleteMessages", chat_id=TG_CHAT, message_ids=json.dumps(part)); done += len(part)
+        except Exception:
+            for mid in part:                                     # по одному: часть могла уже исчезнуть
+                try: tg("deleteMessage", chat_id=TG_CHAT, message_id=mid); done += 1
+                except Exception: pass
+    log.info("/clean: удалено %s сообщений (%s)", done, "всё" if everything else "запросы")
+    return done
+
+def tg_send(text, keyboard=KB_NOW, effect=None, silent=False, kind="query"):
     """sendMessage с HTML. Если Telegram что-то отверг — упрощаем: без эффекта/языка у <pre>, потом текстом."""
     base = dict(chat_id=TG_CHAT, reply_markup=keyboard, link_preview_options=NO_PREVIEW)
     if silent: base["disable_notification"] = "true"
@@ -1313,7 +1350,9 @@ def tg_send(text, keyboard=KB_NOW, effect=None, silent=False):
              dict(text=plain(text))]
     for i, extra in enumerate(tries):
         try:
-            return tg("sendMessage", **base, **extra)["message_id"]
+            mid = tg("sendMessage", **base, **extra)["message_id"]
+            remember(mid, kind)
+            return mid
         except urllib.error.HTTPError as e:
             if e.code != 400 or i == len(tries) - 1: raise
             log.error("telegram 400 (%s), упрощаю", e.read()[:200])
@@ -1328,7 +1367,9 @@ def tg_photo(png, caption, keyboard=KB_GRAPH):
              f'Content-Type: image/png\r\n\r\n').encode() + png + f"\r\n--{b}--\r\n".encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data=body,
                                  headers={"Content-Type": f"multipart/form-data; boundary={b}"})
-    with urllib.request.urlopen(req, timeout=30) as r: return json.load(r)["result"]
+    with urllib.request.urlopen(req, timeout=30) as r: res = json.load(r)["result"]
+    remember(res.get("message_id"))
+    return res
 
 def flush():
     mid = None
@@ -1337,7 +1378,7 @@ def flush():
         if time.time() - ts > 90:
             text = f"<i>⏱ событие в {tt(ts)}, доставлено с задержкой</i>\n{text}"
         try:
-            mid = tg_send(text, keyboard, effect, silent)
+            mid = tg_send(text, keyboard, effect, silent, kind="event")
         except urllib.error.HTTPError as e:
             if e.code == 400:
                 log.error("telegram: сообщение отброшено"); outbox.pop(0); continue
@@ -1586,6 +1627,17 @@ def handle_update(u):
         if data == "cl":
             tg("answerCallbackQuery", callback_query_id=cq["id"], text="Спрашиваю датчики…")
             edit(msg["message_id"], climate_text(), KB_CLIMATE); return
+        if data in ("clq", "cla", "cln"):
+            if data == "cln":
+                tg("answerCallbackQuery", callback_query_id=cq["id"], text="Отменено")
+                for mid in (msg["message_id"],):
+                    try: tg("deleteMessage", chat_id=TG_CHAT, message_id=mid)
+                    except Exception: pass
+                return
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Удаляю…")
+            n = clean_chat(data == "cla")
+            if n == 0: tg_send("🧹 <i>Удалять нечего: сообщений моложе 48 часов нет</i>", KB_NONE, silent=True)
+            return
         if data in ("fd", "fy", "fw", "fm"):
             tg("answerCallbackQuery", callback_query_id=cq["id"])
             if not edit(msg["message_id"], finance_text(data[1]), kb_finance(data[1])):
@@ -1612,12 +1664,18 @@ def handle_update(u):
         return
     m = u.get("message") or {}
     if str(m.get("chat", {}).get("id")) != TG_CHAT: return
+    remember(m.get("message_id"))                                  # ваши команды тоже чистятся /clean
     cmd = m.get("text", "").split("@")[0].split()[0] if m.get("text") else ""
     if cmd == "/status":
         r = live_status()
         tg_send(r[2] if r else "⚠️ <b>Нет связи с инвертором</b>", KB_REFRESH, silent=True)
     elif cmd == "/report":
         tg_send(report("day"), KB_REPORT, silent=True)
+    elif cmd == "/clean":
+        lst = [x for x in load_json(MSGS_FILE, []) if time.time() - x[1] < 47.5 * 3600]
+        nq, ne = sum(1 for x in lst if x[2] != "event"), sum(1 for x in lst if x[2] == "event")
+        tg_send(f"🧹 <b>Очистить чат?</b>\n<i>Запросы и ответы: {nq} · уведомления: {ne}</i>\n"
+                "<i>Telegram позволяет удалять только сообщения моложе 48 часов</i>", KB_CLEAN, silent=True)
     elif cmd == "/finance":
         tg_send(finance_text("d"), kb_finance("d"), silent=True)
     elif cmd == "/climate":
@@ -1641,6 +1699,7 @@ def updates_loop():
                                                   {"command": "boiler", "description": "Бойлер: расход и деньги"},
                                                   {"command": "climate", "description": "Температура и влажность"},
                                                   {"command": "finance", "description": "Деньги за свет: квартира и бойлер"},
+                                                  {"command": "clean", "description": "Очистить чат"},
                                                   {"command": "report", "description": "Отчёт за день или неделю"},
                                                   {"command": "logs", "description": "Последние строки лога"},
                                                   {"command": "restart", "description": "Перезапустить бота"}]))
