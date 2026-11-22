@@ -1674,7 +1674,7 @@ def handle_update(u):
         tg("answerCallbackQuery", callback_query_id=cq["id"], text="Читаю инвертор…")   # сразу, иначе нажатие «протухнет»
         r = live_status()
         if not r:
-            tg_send(inv_down_text(), KB_REFRESH, silent=True); return
+            tg_send(inv_down_text(), KB_REFRESH if live.get("inv_off") else KB_INV_DOWN, silent=True); return
         d, grid, text = r
         if data == "rf":
             edit(msg["message_id"], text, KB_REFRESH)
@@ -1687,7 +1687,7 @@ def handle_update(u):
     cmd = m.get("text", "").split("@")[0].split()[0] if m.get("text") else ""
     if cmd == "/status":
         r = live_status()
-        tg_send(r[2] if r else inv_down_text(), KB_REFRESH, silent=True)
+        tg_send(r[2] if r else inv_down_text(), KB_REFRESH if r or live.get("inv_off") else KB_INV_DOWN, silent=True)
     elif cmd == "/report":
         tg_send(report("day"), KB_REPORT, silent=True)
     elif cmd == "/clean":
