@@ -1293,6 +1293,7 @@ KB_CLIMATE_G = kbs(("📈 Сутки", "clg24"), ("🗓 7 дней", "clg168"))
 KB_CLEAN = json.dumps({"inline_keyboard": [[{"text": "🧹 Запросы и ответы", "callback_data": "clq"},
                                               {"text": "🗑 Всё", "callback_data": "cla"}],
                                              [{"text": "Отмена", "callback_data": "cln"}]]})
+KB_INV_DOWN = kbs(("🔌 Это я выключил", "invoff"), ("📊 Статус", "now"))
 KB_NONE = json.dumps({"inline_keyboard": []})
 KB_GRAPH = json.dumps({"inline_keyboard": [[{"text": "📈 Сутки", "callback_data": "g24"},
                                              {"text": "📈 7 дней", "callback_data": "g168"}]]})
@@ -1533,6 +1534,17 @@ def save(st):
     with open(STATE_FILE, "w") as f: json.dump(st, f)
 
 # ================= кнопки и команды (отдельный поток, long polling) =================
+def inv_down_text():
+    """Ответ на /status, когда инвертор не отвечает и свежих данных нет."""
+    if live.get("inv_off"):
+        out = [f"⏸ <b>Инвертор выключен</b> · с {tt(live['inv_off'])}"]
+    else:
+        out = ["⚠️ <b>Нет связи с инвертором</b>"]
+    b = live.get("boiler") if BOILER_ID else None
+    if b: out.append(f"🔥 Бойлер {'греет <b>' + pw(b[1]) + '</b>' if b[0] and b[1] and b[1] >= 30 else 'включён, не греет' if b[0] else 'выключен'}")
+    out.append("<i>Данные появятся, когда инвертор снова будет на связи</i>")
+    return "\n".join(out)
+
 def live_status():
     """Свежее чтение инвертора; если связи нет — последние данные с пометкой."""
     try:
@@ -1540,7 +1552,8 @@ def live_status():
     except Exception:
         d = live["d"]
         if not d: return None
-        note = f"\n<i>⚠️ Нет связи с инвертором, данные на {tts(live['t'])}</i>"
+        note = (f"\n<i>⏸ Инвертор выключен с {tt(live['inv_off'])} — данные на {tts(live['t'])}</i>" if live.get("inv_off")
+                else f"\n<i>⚠️ Нет связи с инвертором, данные на {tts(live['t'])}</i>")
     grid = d["grid_v"] >= GRID_V_MIN
     if BOILER_ID and grid: live["boiler"] = boiler_state()       # свежая мощность бойлера для суммы
     avg = live["avg"] if live["d"] else d["batt_w"]
@@ -1627,6 +1640,12 @@ def handle_update(u):
         if data == "cl":
             tg("answerCallbackQuery", callback_query_id=cq["id"], text="Спрашиваю датчики…")
             edit(msg["message_id"], climate_text(), KB_CLIMATE); return
+        if data == "invoff":
+            live["inv_off"] = time.time()
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Понял, не беспокою")
+            edit(msg["message_id"], f"⏸ <b>Инвертор выключен вами</b> · {tts(time.time())}\n"
+                 "<i>Не беспокою, пока он не включится. Бойлер и климат считаются как обычно.</i>", KB_NOW)
+            return
         if data in ("clq", "cla", "cln"):
             if data == "cln":
                 tg("answerCallbackQuery", callback_query_id=cq["id"], text="Отменено")
@@ -1655,7 +1674,7 @@ def handle_update(u):
         tg("answerCallbackQuery", callback_query_id=cq["id"], text="Читаю инвертор…")   # сразу, иначе нажатие «протухнет»
         r = live_status()
         if not r:
-            tg_send("⚠️ <b>Нет связи с инвертором</b>", KB_REFRESH, silent=True); return
+            tg_send(inv_down_text(), KB_REFRESH, silent=True); return
         d, grid, text = r
         if data == "rf":
             edit(msg["message_id"], text, KB_REFRESH)
@@ -1668,7 +1687,7 @@ def handle_update(u):
     cmd = m.get("text", "").split("@")[0].split()[0] if m.get("text") else ""
     if cmd == "/status":
         r = live_status()
-        tg_send(r[2] if r else "⚠️ <b>Нет связи с инвертором</b>", KB_REFRESH, silent=True)
+        tg_send(r[2] if r else inv_down_text(), KB_REFRESH, silent=True)
     elif cmd == "/report":
         tg_send(report("day"), KB_REPORT, silent=True)
     elif cmd == "/clean":
@@ -1752,7 +1771,9 @@ def main():
     samples = deque(maxlen=6)     # мощность батареи для сглаживания
     chg = deque(maxlen=6)         # ≈1 мин стабильного заряда после появления сети
     eta = None                    # ждём прогноз после появления сети
-    cnt, d, fail_since, link_alert = 0, None, None, False
+    cnt, d, fail_since = 0, None, None
+    link_alert = st.get("link_alert", False)                      # помним и после перезапуска бота
+    live["inv_off"] = st.get("inv_off")                            # «инвертор выключен вами» — не беспокоить
     polls, fpend, fcnt = 0, None, 0
     hist_at, over_n, over_at = 0, 0, 0
     spike, full_n = None, 0                       # фильтр скачков SOC и антидребезг «заряжена»
@@ -1774,13 +1795,18 @@ def main():
         t0 = time.time()
         ch = yasno_refresh()
         if ch: send(sched_change_text(*ch))
+        if live.get("inv_off") != st.get("inv_off"):              # кнопка «Это я выключил» (поток кнопок)
+            st["inv_off"] = live.get("inv_off"); save(st)
         try:
             d = read_locked()
         except Exception as e:
-            log.warning("inverter: %s %s", type(e).__name__, e)
+            if not live.get("inv_off") or fail_since is None:
+                log.warning("inverter: %s %s", type(e).__name__, e)
             fail_since = fail_since or t0
-            if not link_alert and t0 - fail_since > LINK_TIMEOUT:
-                send("⚠️ <b>Нет связи с инвертором</b>\n<i>больше 5 мин: выключен / логгер / Wi-Fi</i>"); link_alert = True
+            if not link_alert and not live.get("inv_off") and t0 - fail_since > LINK_TIMEOUT:
+                send(f"⚠️ <b>Нет связи с инвертором</b> · {tt(fail_since)}\n<i>больше 5 мин: выключен / логгер / Wi-Fi</i>\n"
+                     "<i>Выключили сами — нажмите «Это я выключил», и я не буду беспокоить</i>", KB_INV_DOWN)
+                link_alert = True; st["link_alert"] = True; save(st)
             flush()
             time.sleep(POLL); continue
 
@@ -1796,8 +1822,14 @@ def main():
         live.update(d=d, t=t0, avg=avg)
         grid = d["grid_v"] >= GRID_V_MIN
 
-        if link_alert:
-            send(status(d, grid, avg, "✅ <b>Связь с инвертором есть</b>"), KB_REFRESH, silent=True); link_alert = False
+        if link_alert or live.get("inv_off"):
+            if live.get("inv_off"):
+                send(f"✅ <b>Инвертор снова на связи</b> · {tt(t0)}\n<i>был выключен {dur((t0 - live['inv_off']) / 3600)}</i>",
+                     KB_NOW, silent=True)
+            else:
+                send(status(d, grid, avg, "✅ <b>Связь с инвертором есть</b>"), KB_REFRESH, silent=True)
+            link_alert = False; live["inv_off"] = None
+            st.update(link_alert=False, inv_off=None); save(st)
 
         if st["grid"] is None:                                   # первый запуск
             st.update(grid=grid, since=t0); save(st)
