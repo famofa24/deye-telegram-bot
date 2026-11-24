@@ -62,6 +62,7 @@ BOILER_ID      = E("BOILER_ID", "")                  # id розетки из de
 BOILER_IP      = E("BOILER_IP", "") or None          # пусто — найти в сети автоматически
 BOILER_VERSION = float(E("BOILER_VERSION", "3.3"))
 BOILER_KEYFILE = E("BOILER_KEYFILE", "devices.json")  # локальный ключ берётся отсюда, в .env его нет
+BOILER_CONTROL = E("BOILER_CONTROL", "1") == "1"     # 0 — только учёт, бот сам розетку не переключает
 BOILER_POWER_DP = E("BOILER_POWER_DP", "19")         # поле мощности (0,1 Вт): обычно 19, у T34-Smart Plug+ — 22
 
 logging.Formatter.converter = lambda *a: datetime.now(TZ).timetuple()   # время в логах — киевское
@@ -1864,7 +1865,7 @@ def main():
                 was = dur((t0 - st["since"]) / 3600)
                 st.update(grid=grid, since=t0)
                 if grid:
-                    bl = boiler_line(boiler_set(True), True)      # свет есть — бойлер включаем
+                    bl = boiler_line(boiler_set(True), True) if BOILER_CONTROL else []   # свет есть — бойлер включаем
                     ch = yasno_refresh(force=True)                # график мог обновиться
                     if ch: send(sched_change_text(*ch))
                     mid = send(on_text(d, was, t0, extra=bl), effect=EFF_PARTY)
@@ -1873,7 +1874,7 @@ def main():
                 else:
                     eta = None
                     st["alerted"] = [x for x in SOC_ALERTS if d["soc"] <= x]
-                    bl = boiler_line(boiler_set(False), False)    # света нет — бойлер выключаем сразу
+                    bl = boiler_line(boiler_set(False), False) if BOILER_CONTROL else []  # света нет — выключаем
                     recent = mean(list(samples)[-CONFIRM:])
                     send(off_text(d, was, t0, recent, bl))
                 save(st)
@@ -1901,7 +1902,7 @@ def main():
         if st["grid"] and not st.get("full_sent", True) and full_n >= 3:   # 100% три опроса подряд
             send(full_text(t0), effect=EFF_LIKE); st["full_sent"] = True; save(st)
 
-        if BOILER_ID and polls % 3 == 0:                          # бойлер: страховка (опрос — в boiler_loop)
+        if BOILER_ID and BOILER_CONTROL and polls % 3 == 0:       # бойлер: страховка (опрос — в boiler_loop)
             b = live.get("boiler")
             if st["grid"] is False and b and b[0]:
                 log.warning("бойлер включён при отключении — выключаю")
