@@ -165,7 +165,9 @@ def boiler_cloud(on=None):
                 _cloud_at = 0; return None
             if BOILER_ID not in m.device_map or time.time() - _cloud_at > (300 if m.mq else 60):
                 m.update_device_cache(); _cloud_at = time.time()     # между обновлениями статус свежий по MQTT
-            st = m.device_map[BOILER_ID].status
+            dev = m.device_map[BOILER_ID]
+            if not dev.online: return None                            # без питания облако отдаёт старое состояние
+            st = dev.status
         p = st.get("cur_power")
         return bool(st.get("switch_1")), (p / 10 if isinstance(p, (int, float)) else None)
     except Exception as e:
@@ -213,12 +215,25 @@ def boiler_set(on):
         s = boiler_state()
         if s and s[0] == on:
             log.info("бойлер %s", "включён" if on else "выключен"); live["boiler"] = s
+            live.pop("boiler_want", None)
             return True
+        if s is None and i == 0 and not on:
+            return "nopower"                                          # света нет — розетка обесточена, это и есть «выкл»
         time.sleep(1)
+    if s is None:                                                     # розетка ещё загружается — включит boiler_loop
+        live["boiler_want"] = on
+        return "pending"
     return False
+
+def boiler_off_text():
+    """Как назвать молчащую розетку: света нет — значит, обесточена (бойлер подключён мимо инвертора)."""
+    d = live.get("d")
+    return "обесточен — света нет" if d and d["grid_v"] < GRID_V_MIN else "нет связи с розеткой"
 
 def boiler_line(ok, on):
     if ok is None: return []
+    if ok == "nopower": return ["🔥 Бойлер обесточен вместе со светом"]
+    if ok == "pending": return [f"🔥 Бойлер {'включится' if on else 'выключится'}, когда розетка выйдет на связь"]
     if ok: return [f"🔥 Бойлер {'включён' if on else 'выключен'}"]
     return [f"⚠️ <b>Бойлер не {'включился' if on else 'отключился'}</b> — проверь розетку"]
 
@@ -484,7 +499,7 @@ def power_lines(d):
     out = []
     if BOILER_ID:
         b = live.get("boiler")
-        if not b: out.append("🔥 Бойлер: нет связи с розеткой")
+        if not b: out.append(f"🔥 Бойлер: {boiler_off_text()}")
         elif not b[0]: out.append("🔥 Бойлер выключен")
         elif b[1] is None: out.append("🔥 Бойлер включён")
         elif b[1] < 30: out.append("🔥 Бойлер включён · не греет")
@@ -524,7 +539,7 @@ def details(d, load=False, pv=False, boiler=True):
         lines.append(f"🌡 Батарея {num(d['batt_t'])} °C" + (f" · инвертор {num(inv_t)} °C" if inv_t is not None else ""))
     if BOILER_ID and boiler:
         b = live.get("boiler")
-        lines.append("🔥 Бойлер: нет связи с розеткой" if not b else
+        lines.append(f"🔥 Бойлер: {boiler_off_text()}" if not b else
                      f"🔥 Бойлер: {'вкл' if b[0] else 'выкл'}" + (f" · {pw(b[1])}" if b[0] and b[1] else ""))
     pi = pi_line()
     if pi: lines.append(pi)
@@ -955,7 +970,7 @@ def boiler_text(period):
     title = {"d": "сегодня", "y": f"вчера, {start_day.day} {MONTHS_GEN[start_day.month - 1]}", "w": f"7 дней · {start_day:%d.%m}–{today:%d.%m}",
              "m": f"{MONTHS[today.month - 1]} {today.year}"}[period]
     b = live.get("boiler")
-    now_line = ("⚠️ нет связи с розеткой" if not b else "⏸ розетка выключена" if not b[0] else
+    now_line = (("🔌 " if "обесточен" in boiler_off_text() else "⚠️ ") + boiler_off_text() if not b else "⏸ розетка выключена" if not b[0] else
                 f"🔥 греет <b>{pw(b[1])}</b>" if b[1] and b[1] >= 30 else "✅ вода нагрета, не греет")
     if b and live.get("boiler_src") == "cloud": now_line += " · <i>через облако</i>"
     n_days = 1 if period == "y" else (today - start_day).days + 1
@@ -1740,6 +1755,13 @@ def boiler_loop():
     while True:
         b = boiler_state()
         live["boiler"] = b
+        want = live.get("boiler_want")
+        if b and want is not None and b[0] != want:                   # розетка загрузилась после появления света
+            if boiler_set(want) is True:
+                send(f"🔥 Бойлер {'включён' if want else 'выключен'} · розетка вышла на связь", KB_NOW, silent=True)
+            b = live.get("boiler")
+        elif b and want is not None:
+            live.pop("boiler_want", None)
         if b:
             try: boiler_add(b)
             except Exception as e: log.warning("boiler history: %s", e)
