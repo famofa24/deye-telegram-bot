@@ -188,13 +188,14 @@ def boiler_state():
             live["boiler_src"] = "local"
             return bool(dps["1"]), (p / 10 if isinstance(p, (int, float)) else None)
         except Exception as e:
-            if live.get("boiler_src") != "cloud": log.warning("boiler: %s %s", type(e).__name__, e)
+            if live.get("boiler_src", "local") == "local": log.warning("boiler: %s %s", type(e).__name__, e)
             _boiler = None
     c = boiler_cloud()
     if c is not None:
         if live.get("boiler_src") != "cloud": log.warning("бойлер: локально не отвечает, работаю через облако Tuya")
         live["boiler_src"] = "cloud"
     else:
+        if live.get("boiler_src") is not None: log.warning("бойлер: розетка не отвечает (нет питания или Wi-Fi)")
         live["boiler_src"] = None
     return c
 
