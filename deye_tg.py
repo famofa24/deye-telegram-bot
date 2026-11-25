@@ -1470,6 +1470,7 @@ def ago(t):
 
 PENDING = "⏳ <i>Считаю время зарядки…</i>"
 NO_CHARGE = verdict(None, "Батарея не заряжается", "сеть есть 5 мин — проверь Grid Charge / TOU")
+NEAR_FULL = verdict(True, "Батарея почти полная", "последние проценты инвертор не дозаряжает — это нормально")
 
 def status(d, grid, avg_w, title="📊 <b>Статус</b>"):
     card = [f"🟢 Сеть <b>{d['grid_v']:.0f} В</b>" if grid else "🔴 <b>Сети нет</b>",
@@ -1892,7 +1893,7 @@ def main():
             elif len(chg) == chg.maxlen and min(chg) > 50:
                 cw = mean(chg); fc, verd = charge_forecast(d["soc"], cw)
             elif t0 - eta["t0"] > 300:
-                fc, verd = [], NO_CHARGE
+                fc, verd = [], (NEAR_FULL if d["soc"] >= 95 else NO_CHARGE)
             if fc is not None:
                 text = on_text(d, eta["was"], eta["t0"], cw, fc, verd, eta.get("bl", ()))
                 if not (eta["mid"] and edit(eta["mid"], text)): send(text)
