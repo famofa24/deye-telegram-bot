@@ -1473,7 +1473,9 @@ NO_CHARGE = verdict(None, "Батарея не заряжается", "сеть 
 NEAR_FULL = verdict(True, "Батарея почти полная", "последние проценты инвертор не дозаряжает — это нормально")
 
 def status(d, grid, avg_w, title="📊 <b>Статус</b>"):
-    card = [f"🟢 Сеть <b>{d['grid_v']:.0f} В</b>" if grid else "🔴 <b>Сети нет</b>",
+    since = live.get("since") if live.get("grid") == grid else None
+    ago_ = f" · с {tt(since)} <i>({dur((time.time() - since) / 3600)})</i>" if since else ""
+    card = [(f"🟢 Сеть <b>{d['grid_v']:.0f} В</b>" if grid else "🔴 <b>Сети нет</b>") + ago_,
             batt_line(d), flow_line(d), f"🏠 Нагрузка <b>{pw(d['load_w'])}</b>"]
     if d.get("pv_w"): card.append(f"☀️ PV <b>{pw(d['pv_w'])}</b>")
     if grid: card += power_lines(d)
@@ -1806,6 +1808,7 @@ def main():
     live["faults"] = st.get("faults", [])
     if "full_at" not in st: st["full_at"] = time.time(); save(st)  # отсчёт калибровки — с первого запуска
     live["full_at"] = st["full_at"]
+    live.update(grid=st.get("grid"), since=st.get("since"))         # «свет есть / нет с …» в статусе
     if os.path.exists(RESTART_FLAG):                             # бот поднялся после /restart
         try: took = int(time.time() - float(open(RESTART_FLAG).read()))
         except Exception: took = 0
@@ -1857,14 +1860,14 @@ def main():
             st.update(link_alert=False, inv_off=None); save(st)
 
         if st["grid"] is None:                                   # первый запуск
-            st.update(grid=grid, since=t0); save(st)
+            st.update(grid=grid, since=t0); save(st); live.update(grid=grid, since=t0)
             send(status(d, grid, avg, "🤖 <b>Мониторинг запущен</b>"), KB_REFRESH, silent=True)
         elif grid != st["grid"]:
             cnt += 1
             if cnt >= CONFIRM:
                 cnt = 0
                 was = dur((t0 - st["since"]) / 3600)
-                st.update(grid=grid, since=t0)
+                st.update(grid=grid, since=t0); live.update(grid=grid, since=t0)
                 if grid:
                     bl = boiler_line(boiler_set(True), True) if BOILER_CONTROL else []   # свет есть — бойлер включаем
                     ch = yasno_refresh(force=True)                # график мог обновиться
