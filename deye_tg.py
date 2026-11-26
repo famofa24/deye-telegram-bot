@@ -1148,21 +1148,35 @@ def climate_text():
 
 # ================= финансы: квартира + бойлер =================
 def apt_energy(start, end):
-    """Через инвертор за [start, end): (квартира днём, ночью, заряд батареи днём, ночью — кВт·ч, сек без данных).
-    Из сети (рег. 76) = квартира + заряд батареи (рег. 70); заряд — от сети, солнечных панелей нет."""
+    """Через инвертор за [start, end), по дневным счётчикам Deye, раздельно ночь/день:
+    {"apt": квартира из сети, "chg": заряд батареи, "inv": сам инвертор (потери и собственное потребление),
+     "load": квартира всего, "dis": отдала батарея} — каждое [день, ночь] кВт·ч; плюс сек без данных.
+    Баланс: из сети (76) + разряд (71) = квартира (84) + заряд (70) + инвертор."""
     with closing(db()) as c:
-        rows = c.execute("select ts, imp, chg from samples where ts >= ? and ts < ? order by ts", (start, end)).fetchall()
-    kd, kn = grid_cost([(r[0], r[1]) for r in rows])
-    cd, cn = grid_cost([(r[0], r[2]) for r in rows])
-    cd, cn = min(cd, kd), min(cn, kn)                                  # заряд не больше взятого из сети
-    kd, kn = kd - cd, kn - cn
+        rows = c.execute("select ts, imp, chg, dis, eload from samples where ts >= ? and ts < ? order by ts",
+                         (start, end)).fetchall()
+    acc = {k: [0.0, 0.0] for k in ("imp", "chg", "dis", "load")}
+    prev = None
+    for ts_, *vals in rows:
+        if prev is not None:
+            z = 1 if is_night(ts_) else 0
+            for k, v, p in zip(("imp", "chg", "dis", "load"), vals, prev):
+                if v is None or p is None: continue
+                acc[k][z] += v - p if v >= p else v                    # счётчики обнуляются в полночь
+        prev = vals
+    out = {"load": acc["load"], "dis": acc["dis"], "chg": [0.0, 0.0], "apt": [0.0, 0.0], "inv": [0.0, 0.0]}
+    for z in (0, 1):
+        imp = acc["imp"][z]
+        chg = min(acc["chg"][z], imp)                                  # заряд — из сети, панелей нет
+        apt = min(max(0.0, acc["load"][z] - acc["dis"][z]), imp - chg)  # квартира, оплаченная из сети
+        out["chg"][z], out["apt"][z], out["inv"][z] = chg, apt, max(0.0, imp - chg - apt)
     with closing(db()) as c: first = c.execute("select min(ts) from samples").fetchone()[0] or end
     start, stop = max(start, first), min(end, time.time())            # до начала истории — не «дыра»
-    if stop <= start: return kd, kn, cd, cn, 0
-    if not rows: return kd, kn, cd, cn, stop - start
+    if stop <= start: return out, 0
+    if not rows: return out, stop - start
     gap = max(0, rows[0][0] - start - 120) + max(0, stop - rows[-1][0] - 120)
-    gap += sum(b[0] - a[0] for a, b in zip(rows, rows[1:]) if b[0] - a[0] > 300)
-    return kd, kn, cd, cn, gap
+    gap += sum(b_[0] - a_[0] for a_, b_ in zip(rows, rows[1:]) if b_[0] - a_[0] > 300)
+    return out, gap
 
 def finance_text(period):
     """/finance: деньги за свет — квартира (через инвертор) + бойлер (розетка). period: d / y / w / m."""
@@ -1172,24 +1186,30 @@ def finance_text(period):
     days = [start_day + timedelta(days=i) for i in range((last_day - start_day).days + 1)]
     ts = lambda d: datetime.combine(d, dtime(0), tzinfo=TZ).timestamp()
     cost = lambda d_, n_: d_ * TARIFF_DAY + n_ * TARIFF_NIGHT
-    per = []                                                    # по дням: (день, квартира ₴, бойлер ₴, заряд ₴)
-    a_d = a_n = c_d = c_n = b_d = b_n = 0.0; gap = 0
+    per = []                                                    # по дням: (день, квартира ₴, бойлер ₴, заряд ₴, инвертор ₴)
+    T = {k: [0.0, 0.0] for k in ("apt", "chg", "inv", "load", "dis", "boil")}; gap = 0
     for d in days:
         s, e = ts(d), ts(d + timedelta(days=1))
-        kd, kn, cd, cn, g = apt_energy(s, e)
+        o, g = apt_energy(s, e)
         bb = boiler_buckets(s, 1, 86400)[0] if BOILER_ID else [0.0, 0.0, 0.0]
-        a_d += kd; a_n += kn; c_d += cd; c_n += cn; b_n += bb[0]; b_d += bb[1]; gap += g
-        per.append((d, cost(kd, kn), bb[2], cost(cd, cn)))
-    apt_c, chg_c, boil_c = cost(a_d, a_n), cost(c_d, c_n), cost(b_d, b_n)
-    total_c, total_k = apt_c + chg_c + boil_c, a_d + a_n + c_d + c_n + b_d + b_n
-    nk, dk = a_n + c_n + b_n, a_d + c_d + b_d
+        o["boil"] = [bb[1], bb[0]]
+        for k in T:
+            T[k][0] += o[k][0]; T[k][1] += o[k][1]
+        gap += g
+        per.append((d, cost(*o["apt"]), bb[2], cost(*o["chg"]), cost(*o["inv"])))
+    apt_c, chg_c, inv_c, boil_c = (cost(*T[k]) for k in ("apt", "chg", "inv", "boil"))
+    kw_ = lambda k: sum(T[k])
+    total_c = apt_c + chg_c + inv_c + boil_c
+    total_k = kw_("apt") + kw_("chg") + kw_("inv") + kw_("boil")
+    dk = sum(T[k][0] for k in ("apt", "chg", "inv", "boil")); nk = sum(T[k][1] for k in ("apt", "chg", "inv", "boil"))
     title = {"d": "сегодня", "y": f"вчера, {start_day.day} {MONTHS_GEN[start_day.month - 1]}",
              "w": f"7 дней · {start_day:%d.%m}–{today:%d.%m}", "m": f"{MONTHS[today.month - 1]} {today.year}"}[period]
     span = {"d": "за сегодня", "y": f"за вчера, {start_day:%d.%m}", "w": "за 7 дней", "m": f"за {MONTHS[today.month - 1]}"}[period]
     card = [f"💸 Всего {span}: <b>{grn(total_c)}</b> · {kwh(total_k)}",
-            f"🏠 Квартира: <b>{grn(apt_c)}</b> · {kwh(a_d + a_n)}",
-            f"🔋 Заряд батареи: <b>{grn(chg_c)}</b> · {kwh(c_d + c_n)}" if c_d + c_n >= 0.05 else None,
-            f"🔥 Бойлер: <b>{grn(boil_c)}</b> · {kwh(b_d + b_n)}" if BOILER_ID else None]
+            f"🏠 Квартира: <b>{grn(apt_c)}</b> · {kwh(kw_('apt'))}",
+            f"🔋 Заряд батареи: <b>{grn(chg_c)}</b> · {kwh(kw_('chg'))}" if kw_("chg") >= 0.05 else None,
+            f"⚙️ Сам инвертор: <b>{grn(inv_c)}</b> · {kwh(kw_('inv'))}" if kw_("inv") >= 0.05 else None,
+            f"🔥 Бойлер: <b>{grn(boil_c)}</b> · {kwh(kw_('boil'))}" if BOILER_ID else None]
     tariff = [f"🌙 Ночь: {kwh(nk)} × {num(TARIFF_NIGHT, 2)} = <b>{grn(nk * TARIFF_NIGHT)}</b>",
               f"☀️ День: {kwh(dk)} × {num(TARIFF_DAY, 2)} = <b>{grn(dk * TARIFF_DAY)}</b>"]
     out = [f"💰 <b>Финансы</b> · {title} · {tts(time.time())}", quote([x for x in card if x]), quote(tariff)]
@@ -1202,13 +1222,18 @@ def finance_text(period):
         if period == "m":
             avg.append(f"📆 Прогноз на месяц: <b>≈ {grn(total_c / n * calendar.monthrange(today.year, today.month)[1])}</b>")
         out += avg
-        mx = max((a + b + c for _, a, b, c in per), default=0)
+        mx = max((a + b + c + i for _, a, b, c, i in per), default=0)
         WD = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
-        lines = [f"{WD[d.weekday()]} {d:%d.%m} {spark(a + b + c, mx)} <b>{num(a + b + c, 2)} грн</b> · 🏠 {num(a, 2)}"
-                 + (f" · 🔋 {num(c, 2)}" if c >= 0.01 else "") + (f" · 🔥 {num(b, 2)}" if BOILER_ID else "")
-                 for d, a, b, c in per]
+        lines = [f"{WD[d.weekday()]} {d:%d.%m} {spark(a + b + c + i, mx)} <b>{num(a + b + c + i, 2)} грн</b> · 🏠 {num(a, 2)}"
+                 + (f" · 🔋 {num(c, 2)}" if c >= 0.01 else "") + (f" · ⚙️ {num(i, 2)}" if i >= 0.01 else "")
+                 + (f" · 🔥 {num(b, 2)}" if BOILER_ID else "")
+                 for d, a, b, c, i in per]
         out.append(fold(["📅 <b>По дням</b>"] + lines[::-1]))
     extra = []
+    if kw_("dis") >= 0.05:
+        extra.append(f"🏠 Квартира потребила всего {kwh(kw_('load'))}, из них {kwh(kw_('dis'))} — от батареи")
+    if kw_("inv") >= 0.05:
+        extra.append("⚙️ Сам инвертор = из сети − квартира − заряд + разряд: потери и его собственное потребление")
     with closing(db()) as c: first = c.execute("select min(ts) from samples").fetchone()[0]
     if first and first > ts(start_day) + 3600:
         extra.append(f"Данные квартиры есть с {datetime.fromtimestamp(first, TZ):%d.%m %H:%M}")
