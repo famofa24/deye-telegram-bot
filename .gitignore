@@ -12,3 +12,5 @@ devices.json
 tinytuya.json
 tuya-raw.json
 snapshot.json
+# генератор видео: промежуточные файлы
+tools/video/out/
